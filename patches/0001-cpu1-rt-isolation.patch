@@ -1,0 +1,47 @@
+diff --git a/kernel/evl/clock.c b/kernel/evl/clock.c
+index d5d7ece28..9df7950f3 100644
+--- a/kernel/evl/clock.c
++++ b/kernel/evl/clock.c
+@@ -17,6 +17,7 @@
+ #include <linux/clocksource.h>
+ #include <linux/bitmap.h>
+ #include <linux/sched/signal.h>
++#include <linux/sched/isolation.h>
+ #include <linux/mutex.h>
+ #include <linux/slab.h>
+ #include <linux/anon_inodes.h>
+@@ -319,7 +320,8 @@ static void do_clock_tick(struct evl_clock *clock, struct evl_timerbase *tmb)
+ 		 * of the core tick interrupt.
+ 		 */
+ 		if (unlikely(timer == &rq->inband_timer)) {
+-			rq->local_flags |= RQ_TPROXY;
++			if (!cpu_is_isolated(evl_rq_cpu(rq)))
++				rq->local_flags |= RQ_TPROXY;
+ 			continue;
+ 		}
+ 
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 2e8067911..c4d6c45ba 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -5735,6 +5735,10 @@ static void sched_tick_remote(struct work_struct *work)
+ 	struct rq *rq = cpu_rq(cpu);
+ 	int os;
+ 
++	/* Skip entirely for isolated CPUs — no tick, no requeue. */
++	if (cpu_is_isolated(cpu))
++		return;
++
+ 	/*
+ 	 * Handle the tick only if it appears the remote CPU is running in full
+ 	 * dynticks mode. The check is racy by nature, but missing a tick or
+@@ -5783,6 +5787,9 @@ static void sched_tick_start(int cpu)
+ 	if (housekeeping_cpu(cpu, HK_TYPE_TICK))
+ 		return;
+ 
++	if (cpu_is_isolated(cpu))
++		return;
++
+ 	WARN_ON_ONCE(!tick_work_cpu);
+ 
+ 	twork = per_cpu_ptr(tick_work_cpu, cpu);
