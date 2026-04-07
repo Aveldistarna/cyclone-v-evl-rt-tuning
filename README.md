@@ -34,6 +34,7 @@ Spikes >10000 ns: 0
 - **ボード**: Intel Cyclone V SoC (DE10-Nano)
 - **CPU**: ARM Cortex-A9 dual-core @ 800 MHz
 - **カーネル**: Linux 6.12.67 + EVL (Xenomai 4) co-kernel
+  - ベース: [linux-evl](https://source.denx.de/Xenomai/xenomai4/linux-evl) commit `a0119f32d` (`evl/v6.12.y` ブランチ相当)
 - **必要なカーネルコンフィグ**:
   - `CONFIG_HZ=1000`
   - `CONFIG_NO_HZ_FULL=y`
