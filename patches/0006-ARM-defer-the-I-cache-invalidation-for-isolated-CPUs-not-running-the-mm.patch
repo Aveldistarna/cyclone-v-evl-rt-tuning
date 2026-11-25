@@ -1,0 +1,211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Aveldistarna <Aveldistarna@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 00:34:59 +0900
+Subject: [PATCH] ARM: defer the I-cache invalidation of a new executable
+ mapping for isolated CPUs not running the mm
+
+On SMP ARMv7 the I-cache invalidation done by __sync_icache_dcache() for a
+new executable mapping is a broadcast (ICIALLUIS). It wipes the I-cache of an
+isolated CPU running out-of-band code, which then stalls for hundreds of
+cycles refetching its loop (measured: ~285 cycles per broadcast).
+
+An isolated CPU that is not in mm_cpumask(mm) cannot execute the new mapping
+without switching to that mm first. Mark such CPUs in icache_stale_cpus and
+invalidate only locally; a marked CPU invalidates its own I-cache and branch
+predictor in __switch_mm(), after its mm_cpumask update. If another
+housekeeping CPU is online, or a marked CPU is already in mm_cpumask(mm),
+fall back to the broadcast. Mapping an already-clean folio into an mm that a
+marked CPU runs also broadcasts, since that CPU will not switch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm/include/asm/mmu_context.h | 31 ++++++++++++
+ arch/arm/include/asm/pgtable.h     |  4 +-
+ arch/arm/mm/flush.c                | 79 ++++++++++++++++++++++++++++--
+ arch/arm/mm/mmu.c                  |  2 +-
+ 4 files changed, 110 insertions(+), 6 deletions(-)
+
+diff --git a/arch/arm/include/asm/mmu_context.h b/arch/arm/include/asm/mmu_context.h
+index 228e022d1228..c6a6f6003f0f 100644
+--- a/arch/arm/include/asm/mmu_context.h
++++ b/arch/arm/include/asm/mmu_context.h
+@@ -111,6 +111,31 @@ static inline void finish_arch_post_lock_switch(void)
+ 
+ #define activate_mm(prev,next)		__switch_mm(prev, next, NULL)
+ 
++#if defined(CONFIG_SMP) && __LINUX_ARM_ARCH__ >= 7
++/*
++ * CPUs whose I-cache invalidation was deferred by __sync_icache_dcache():
++ * isolated CPUs that were not running the mm that got a new executable
++ * mapping. Each one invalidates its own I-cache (and branch predictor) the
++ * next time it switches to a user mm, before it can run code from there.
++ */
++extern cpumask_t icache_stale_cpus;
++
++static inline void icache_stale_consume(unsigned int cpu)
++{
++	if (unlikely(cpumask_test_cpu(cpu, &icache_stale_cpus)) &&
++	    cpumask_test_and_clear_cpu(cpu, &icache_stale_cpus)) {
++		__flush_icache_all_generic();	/* ICIALLU, this CPU only */
++		asm volatile("mcr p15, 0, %0, c7, c5, 6" : : "r" (0));	/* BPIALL */
++		dsb(nsh);
++		isb();
++	}
++}
++#else
++static inline void icache_stale_consume(unsigned int cpu)
++{
++}
++#endif
++
+ /*
+  * This is the actual mm switch as far as the scheduler
+  * is concerned.  No registers are touched.  We avoid
+@@ -139,6 +164,12 @@ __switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ 		if (cache_is_vivt())
+ 			cpumask_clear_cpu(cpu, mm_cpumask(prev));
+ 	}
++	/*
++	 * After the mm_cpumask update above (a fully ordered atomic): either
++	 * a CPU installing an executable mapping into @next sees this CPU in
++	 * mm_cpumask and broadcasts, or this CPU sees its stale mark here.
++	 */
++	icache_stale_consume(cpu);
+ #endif
+ }
+ 
+diff --git a/arch/arm/include/asm/pgtable.h b/arch/arm/include/asm/pgtable.h
+index be91e376df79..f60db826a9e6 100644
+--- a/arch/arm/include/asm/pgtable.h
++++ b/arch/arm/include/asm/pgtable.h
+@@ -202,11 +202,11 @@ static inline bool pte_access_permitted(pte_t pte, bool write)
+ #define pte_access_permitted pte_access_permitted
+ 
+ #if __LINUX_ARM_ARCH__ < 6
+-static inline void __sync_icache_dcache(pte_t pteval)
++static inline void __sync_icache_dcache(struct mm_struct *mm, pte_t pteval)
+ {
+ }
+ #else
+-extern void __sync_icache_dcache(pte_t pteval);
++extern void __sync_icache_dcache(struct mm_struct *mm, pte_t pteval);
+ #endif
+ 
+ #define PFN_PTE_SHIFT		PAGE_SHIFT
+diff --git a/arch/arm/mm/flush.c b/arch/arm/mm/flush.c
+index a2357de8c639..9fd72990156c 100644
+--- a/arch/arm/mm/flush.c
++++ b/arch/arm/mm/flush.c
+@@ -15,6 +15,7 @@
+ #include <asm/smp_plat.h>
+ #include <asm/tlbflush.h>
+ #include <linux/hugetlb.h>
++#include <linux/sched/isolation.h>
+ 
+ #include "mm.h"
+ 
+@@ -289,7 +290,71 @@ static void __flush_dcache_aliases(struct address_space *mapping, struct folio *
+ }
+ 
+ #if __LINUX_ARM_ARCH__ >= 6
+-void __sync_icache_dcache(pte_t pteval)
++#if defined(CONFIG_SMP) && __LINUX_ARM_ARCH__ >= 7
++cpumask_t icache_stale_cpus;
++
++/*
++ * The I-cache invalidation for a new executable mapping into @mm. On SMP it
++ * is a broadcast (ICIALLUIS) that wipes the I-cache of every CPU, including
++ * an isolated CPU running out-of-band code, which then stalls for hundreds
++ * of cycles refetching its loop. Isolated CPUs that are not running @mm
++ * cannot execute the new mapping without switching to @mm first, so they
++ * are only marked in icache_stale_cpus and invalidate their own I-cache in
++ * __switch_mm(). If another housekeeping CPU is online, or a marked CPU is
++ * already in mm_cpumask(@mm), this is the plain broadcast as before.
++ */
++static void flush_icache_for_new_exec(struct mm_struct *mm)
++{
++	unsigned int cpu, this;
++	bool bcast = false;
++
++	if (!mm || !housekeeping_enabled(HK_TYPE_DOMAIN)) {
++		__flush_icache_all();
++		return;
++	}
++	this = get_cpu();
++	for_each_online_cpu(cpu) {
++		if (cpu == this)
++			continue;
++		if (housekeeping_cpu(cpu, HK_TYPE_DOMAIN)) {
++			bcast = true;
++			break;
++		}
++		cpumask_set_cpu(cpu, &icache_stale_cpus);
++	}
++	if (!bcast) {
++		/* Pairs with the mm_cpumask test_and_set in __switch_mm(). */
++		smp_mb();
++		bcast = cpumask_intersects(mm_cpumask(mm), &icache_stale_cpus);
++	}
++	if (bcast) {
++		__flush_icache_all();
++	} else {
++		__flush_icache_all_generic();	/* ICIALLU, this CPU only */
++		asm volatile("mcr p15, 0, %0, c7, c5, 6" : : "r" (0));	/* BPIALL */
++		dsb(nsh);
++	}
++	put_cpu();
++}
++
++/* A marked CPU may be running @mm already: it must not wait for a switch. */
++static inline bool icache_stale_in(struct mm_struct *mm)
++{
++	return mm && cpumask_intersects(mm_cpumask(mm), &icache_stale_cpus);
++}
++#else
++static inline void flush_icache_for_new_exec(struct mm_struct *mm)
++{
++	__flush_icache_all();
++}
++
++static inline bool icache_stale_in(struct mm_struct *mm)
++{
++	return false;
++}
++#endif
++
++void __sync_icache_dcache(struct mm_struct *mm, pte_t pteval)
+ {
+ 	unsigned long pfn;
+ 	struct folio *folio;
+@@ -321,8 +386,16 @@ void __sync_icache_dcache(pte_t pteval)
+ 	 * sync (every exec, every shared library) keeps wiping the I-cache of
+ 	 * an isolated CPU running out-of-band code.
+ 	 */
+-	if (pte_exec(pteval) && !test_and_set_bit(PG_icache_clean, &folio->flags))
+-		__flush_icache_all();
++	if (pte_exec(pteval)) {
++		if (!test_and_set_bit(PG_icache_clean, &folio->flags))
++			flush_icache_for_new_exec(mm);
++		else if (icache_stale_in(mm))
++			/*
++			 * The folio's invalidation may have been deferred for
++			 * a CPU that already runs @mm and would not switch.
++			 */
++			__flush_icache_all();
++	}
+ }
+ #endif
+ 
+diff --git a/arch/arm/mm/mmu.c b/arch/arm/mm/mmu.c
+index f5b7a16c5803..73e60a082496 100644
+--- a/arch/arm/mm/mmu.c
++++ b/arch/arm/mm/mmu.c
+@@ -1814,7 +1814,7 @@ void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 
+ 	if (addr < TASK_SIZE && pte_valid_user(pteval)) {
+ 		if (!pte_special(pteval))
+-			__sync_icache_dcache(pteval);
++			__sync_icache_dcache(mm, pteval);
+ 		ext |= PTE_EXT_NG;
+ 	}
+ 

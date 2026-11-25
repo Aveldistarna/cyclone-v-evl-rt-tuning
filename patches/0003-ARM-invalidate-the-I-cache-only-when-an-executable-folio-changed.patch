@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Aveldistarna <Aveldistarna@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 22:55:20 +0900
+Subject: [PATCH] ARM: only invalidate the I-cache for executable mappings when the folio changed (PG_icache_clean)
+
+On SMP ARMv7, __sync_icache_dcache() invalidates the I-cache of every CPU
+(a broadcast) each time an executable page is mapped into user space, even
+when the page's contents have not changed since the last invalidation:
+every exec and every shared-library mapping does it. An isolated CPU
+running an out-of-band loop then has to refetch its code.
+
+Track with PG_arch_2 (PG_icache_clean) whether the I-cache has been
+invalidated since the folio's contents last changed, and skip the
+invalidation when it has. The bit is cleared when the kernel writes the
+folio (flush_dcache_folio()) or a device does (DMA from the device).
+
+As before, user space that writes instructions itself must use the
+cacheflush system call (__builtin___clear_cache()).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm/Kconfig                  |  1 +
+ arch/arm/include/asm/cacheflush.h |  5 +++++
+ arch/arm/mm/dma-mapping.c         |  7 +++++++
+ arch/arm/mm/flush.c               | 13 ++++++++++++-
+ 4 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
+index bb9b10c97c6a..8a526350f054 100644
+--- a/arch/arm/Kconfig
++++ b/arch/arm/Kconfig
+@@ -3,6 +3,7 @@ config ARM
+ 	bool
+ 	default y
+ 	select ARCH_32BIT_OFF_T
++	select ARCH_USES_PG_ARCH_2
+ 	select ARCH_CORRECT_STACKTRACE_ON_KRETPROBE if HAVE_KRETPROBES && FRAME_POINTER && !ARM_UNWIND
+ 	select ARCH_HAS_BINFMT_FLAT
+ 	select ARCH_HAS_CPU_CACHE_ALIASING
+diff --git a/arch/arm/include/asm/cacheflush.h b/arch/arm/include/asm/cacheflush.h
+index 8ed8b9a24efe..efad3ba8c8cd 100644
+--- a/arch/arm/include/asm/cacheflush.h
++++ b/arch/arm/include/asm/cacheflush.h
+@@ -21,6 +21,11 @@
+  * and does not require cleaning before returning it to the user.
+  */
+ #define PG_dcache_clean PG_arch_1
++/*
++ * The I-cache has been invalidated since the folio's contents last changed.
++ * Cleared when the kernel or a device writes the folio (and when it is freed).
++ */
++#define PG_icache_clean PG_arch_2
+ 
+ /*
+  *	MM Cache Management
+diff --git a/arch/arm/mm/dma-mapping.c b/arch/arm/mm/dma-mapping.c
+index 88c2d68a69c9..cdaf7a93f657 100644
+--- a/arch/arm/mm/dma-mapping.c
++++ b/arch/arm/mm/dma-mapping.c
+@@ -700,9 +700,16 @@ static void __dma_page_dev_to_cpu(struct page *page, unsigned long off,
+ 	/* FIXME: non-speculating: not required */
+ 	/* in any case, don't bother invalidating if DMA to device */
+ 	if (dir != DMA_TO_DEVICE) {
++		unsigned long pfn = PFN_DOWN(paddr), last = PFN_DOWN(paddr + size - 1);
++
+ 		outer_inv_range(paddr, paddr + size);
+ 
+ 		dma_cache_maint_page(page, off, size, dir, dmac_unmap_area);
++
++		/* The device wrote these pages: the I-cache must be resynced. */
++		for (; pfn <= last; pfn++)
++			if (pfn_valid(pfn))
++				clear_bit(PG_icache_clean, &pfn_folio(pfn)->flags);
+ 	}
+ 
+ 	/*
+diff --git a/arch/arm/mm/flush.c b/arch/arm/mm/flush.c
+index 0749cf8a6637..e1a2f33b3686 100644
+--- a/arch/arm/mm/flush.c
++++ b/arch/arm/mm/flush.c
+@@ -307,7 +307,14 @@ void __sync_icache_dcache(pte_t pteval)
+ 	if (!test_and_set_bit(PG_dcache_clean, &folio->flags))
+ 		__flush_dcache_folio(mapping, folio);
+ 
+-	if (pte_exec(pteval))
++	/*
++	 * Only invalidate the I-cache when this folio's contents changed since
++	 * it was last done. On SMP the invalidation is broadcast to every CPU,
++	 * so doing it for each executable mapping of text that is already in
++	 * sync (every exec, every shared library) keeps wiping the I-cache of
++	 * an isolated CPU running out-of-band code.
++	 */
++	if (pte_exec(pteval) && !test_and_set_bit(PG_icache_clean, &folio->flags))
+ 		__flush_icache_all();
+ }
+ #endif
+@@ -342,6 +349,10 @@ void flush_dcache_folio(struct folio *folio)
+ 	if (is_zero_pfn(folio_pfn(folio)))
+ 		return;
+ 
++	/* The kernel wrote the folio: any executable copy must be resynced. */
++	if (test_bit(PG_icache_clean, &folio->flags))
++		clear_bit(PG_icache_clean, &folio->flags);
++
+ 	if (!cache_ops_need_broadcast() && cache_is_vipt_nonaliasing()) {
+ 		if (test_bit(PG_dcache_clean, &folio->flags))
+ 			clear_bit(PG_dcache_clean, &folio->flags);

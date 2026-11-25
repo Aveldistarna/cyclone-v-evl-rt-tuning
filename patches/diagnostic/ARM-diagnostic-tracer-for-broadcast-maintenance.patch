@@ -1,0 +1,365 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Aveldistarna <Aveldistarna@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 23:25:27 +0900
+Subject: [PATCH] ARM: diagnostic tracer for broadcast cache/TLB/BP maintenance (/proc/bcast_trace)
+
+Diagnostic only; off by default and not needed in production.
+
+Records every cache, TLB and branch-predictor maintenance operation that
+is broadcast to the other CPUs (and outer cache maintenance), with a
+CLOCK_MONOTONIC timestamp, the CPU and the call site, in a ring of 16384
+entries. "echo 1 > /proc/bcast_trace" clears the ring and starts
+recording, "echo 0" stops, reading the file dumps it. Used to find which
+kernel paths stall an isolated CPU.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm/include/asm/bcast_trace.h |  27 ++++++++
+ arch/arm/include/asm/cacheflush.h  |   3 +
+ arch/arm/include/asm/outercache.h  |  15 +++-
+ arch/arm/kernel/Makefile           |   2 +-
+ arch/arm/kernel/bcast_trace.c      | 107 +++++++++++++++++++++++++++++
+ arch/arm/kernel/smp_tlb.c          |  23 +++++--
+ arch/arm/kernel/traps.c            |   2 +
+ 7 files changed, 170 insertions(+), 9 deletions(-)
+ create mode 100644 arch/arm/include/asm/bcast_trace.h
+ create mode 100644 arch/arm/kernel/bcast_trace.c
+
+diff --git a/arch/arm/include/asm/bcast_trace.h b/arch/arm/include/asm/bcast_trace.h
+new file mode 100644
+index 000000000000..f86ea04ab23a
+--- /dev/null
++++ b/arch/arm/include/asm/bcast_trace.h
+@@ -0,0 +1,27 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Diagnostic tracer for the CPU1 jitter study: records every cache/TLB/BP
++ * maintenance operation that is broadcast to the other CPUs (and outer cache
++ * maintenance), with a CLOCK_MONOTONIC timestamp and the call site.
++ * Enabled and read through /proc/bcast_trace.
++ */
++#ifndef __ASM_ARM_BCAST_TRACE_H
++#define __ASM_ARM_BCAST_TRACE_H
++
++enum {
++	BT_ICACHE_ALL, BT_TLB_ALL, BT_TLB_MM, BT_TLB_PAGE, BT_TLB_RANGE,
++	BT_TLB_KPAGE, BT_TLB_KRANGE, BT_BP_ALL, BT_CACHEFLUSH,
++	BT_OUTER_INV, BT_OUTER_CLEAN, BT_OUTER_FLUSH, BT_OUTER_FLUSH_ALL,
++	BT_NTYPES
++};
++
++extern int bcast_trace_on;
++void __bcast_trace(unsigned int type, unsigned long ip, unsigned long arg);
++
++static inline void bcast_trace(unsigned int type, unsigned long ip, unsigned long arg)
++{
++	if (unlikely(bcast_trace_on))
++		__bcast_trace(type, ip, arg);
++}
++
++#endif
+diff --git a/arch/arm/include/asm/cacheflush.h b/arch/arm/include/asm/cacheflush.h
+index efad3ba8c8cd..2228406f263f 100644
+--- a/arch/arm/include/asm/cacheflush.h
++++ b/arch/arm/include/asm/cacheflush.h
+@@ -207,8 +207,11 @@ extern void copy_to_user_page(struct vm_area_struct *, struct page *,
+ #define __flush_icache_preferred	__flush_icache_all_generic
+ #endif
+ 
++#include <asm/bcast_trace.h>
++
+ static inline void __flush_icache_all(void)
+ {
++	bcast_trace(BT_ICACHE_ALL, _THIS_IP_, 0);
+ 	__flush_icache_preferred();
+ 	dsb(ishst);
+ }
+diff --git a/arch/arm/include/asm/outercache.h b/arch/arm/include/asm/outercache.h
+index 811978d36e4a..485b2b722280 100644
+--- a/arch/arm/include/asm/outercache.h
++++ b/arch/arm/include/asm/outercache.h
+@@ -11,6 +11,8 @@
+ 
+ #include <linux/types.h>
+ 
++#include <asm/bcast_trace.h>
++
+ struct l2x0_regs;
+ 
+ struct outer_cache_fns {
+@@ -39,8 +41,10 @@ extern struct outer_cache_fns outer_cache;
+  */
+ static inline void outer_inv_range(phys_addr_t start, phys_addr_t end)
+ {
+-	if (outer_cache.inv_range)
++	if (outer_cache.inv_range) {
++		bcast_trace(BT_OUTER_INV, _THIS_IP_, end - start);
+ 		outer_cache.inv_range(start, end);
++	}
+ }
+ 
+ /**
+@@ -50,8 +54,10 @@ static inline void outer_inv_range(phys_addr_t start, phys_addr_t end)
+  */
+ static inline void outer_clean_range(phys_addr_t start, phys_addr_t end)
+ {
+-	if (outer_cache.clean_range)
++	if (outer_cache.clean_range) {
++		bcast_trace(BT_OUTER_CLEAN, _THIS_IP_, end - start);
+ 		outer_cache.clean_range(start, end);
++	}
+ }
+ 
+ /**
+@@ -61,8 +67,10 @@ static inline void outer_clean_range(phys_addr_t start, phys_addr_t end)
+  */
+ static inline void outer_flush_range(phys_addr_t start, phys_addr_t end)
+ {
+-	if (outer_cache.flush_range)
++	if (outer_cache.flush_range) {
++		bcast_trace(BT_OUTER_FLUSH, _THIS_IP_, end - start);
+ 		outer_cache.flush_range(start, end);
++	}
+ }
+ 
+ /**
+@@ -81,6 +89,7 @@ static inline void outer_flush_all(void)
+ 	unsigned long flags;
+ 
+ 	if (outer_cache.flush_all) {
++		bcast_trace(BT_OUTER_FLUSH_ALL, _THIS_IP_, 0);
+ 		flags = hard_cond_local_irq_save();
+ 		outer_cache.flush_all();
+ 		hard_cond_local_irq_restore(flags);
+diff --git a/arch/arm/kernel/Makefile b/arch/arm/kernel/Makefile
+index 6e8ef028015c..03331bd95e9b 100644
+--- a/arch/arm/kernel/Makefile
++++ b/arch/arm/kernel/Makefile
+@@ -17,7 +17,7 @@ CFLAGS_REMOVE_return_address.o = -pg
+ 
+ # Object file lists.
+ 
+-obj-y		:= elf.o entry-common.o irq.o opcodes.o \
++obj-y		:= elf.o entry-common.o irq.o opcodes.o bcast_trace.o \
+ 		   process.o ptrace.o reboot.o io.o \
+ 		   setup.o signal.o sigreturn_codes.o \
+ 		   stacktrace.o sys_arm.o time.o traps.o
+diff --git a/arch/arm/kernel/bcast_trace.c b/arch/arm/kernel/bcast_trace.c
+new file mode 100644
+index 000000000000..c8a9d6a969c2
+--- /dev/null
++++ b/arch/arm/kernel/bcast_trace.c
+@@ -0,0 +1,107 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Diagnostic tracer for the CPU1 jitter study (see asm/bcast_trace.h).
++ * echo 1 > /proc/bcast_trace  clears the ring and starts recording,
++ * echo 0 > /proc/bcast_trace  stops, cat /proc/bcast_trace dumps it.
++ */
++#include <linux/init.h>
++#include <linux/proc_fs.h>
++#include <linux/seq_file.h>
++#include <linux/timekeeping.h>
++#include <linux/uaccess.h>
++#include <linux/atomic.h>
++#include <linux/export.h>
++#include <linux/smp.h>
++#include <linux/math64.h>
++#include <asm/bcast_trace.h>
++
++#define BT_N 16384
++
++struct bt_ent {
++	u64 ns;
++	unsigned long ip;
++	unsigned long arg;
++	u16 type;
++	u16 cpu;
++};
++
++static struct bt_ent bt_ring[BT_N];
++static atomic_t bt_idx = ATOMIC_INIT(0);
++int bcast_trace_on;
++EXPORT_SYMBOL(bcast_trace_on);
++
++static const char *const bt_names[BT_NTYPES] = {
++	"icache_all", "tlb_all", "tlb_mm", "tlb_page", "tlb_range",
++	"tlb_kpage", "tlb_krange", "bp_all", "cacheflush",
++	"outer_inv", "outer_clean", "outer_flush", "outer_flush_all",
++};
++
++void __bcast_trace(unsigned int type, unsigned long ip, unsigned long arg)
++{
++	unsigned int i = (unsigned int)atomic_inc_return(&bt_idx) - 1;
++	struct bt_ent *e = &bt_ring[i % BT_N];
++
++	e->ns = ktime_get_mono_fast_ns();
++	e->ip = ip;
++	e->arg = arg;
++	e->type = type;
++	e->cpu = raw_smp_processor_id();
++}
++EXPORT_SYMBOL(__bcast_trace);
++
++static int bt_show(struct seq_file *m, void *v)
++{
++	unsigned int n = atomic_read(&bt_idx), i, first;
++
++	first = n > BT_N ? n - BT_N : 0;
++	seq_printf(m, "# entries %u (showing %u)\n", n, n - first);
++	for (i = first; i < n; i++) {
++		struct bt_ent *e = &bt_ring[i % BT_N];
++		u32 rem;
++		u64 sec = div_u64_rem(e->ns, NSEC_PER_SEC, &rem);
++
++		seq_printf(m, "%llu.%09u cpu%u %s %lu %pS\n",
++			   sec, rem, e->cpu,
++			   e->type < BT_NTYPES ? bt_names[e->type] : "?", e->arg,
++			   (void *)e->ip);
++	}
++	return 0;
++}
++
++static int bt_open(struct inode *inode, struct file *file)
++{
++	return single_open_size(file, bt_show, NULL, BT_N * 96);
++}
++
++static ssize_t bt_write(struct file *file, const char __user *buf,
++			size_t count, loff_t *ppos)
++{
++	char c;
++
++	if (!count || get_user(c, buf))
++		return -EFAULT;
++	if (c == '1') {
++		bcast_trace_on = 0;
++		atomic_set(&bt_idx, 0);
++		smp_mb();
++		bcast_trace_on = 1;
++	} else {
++		bcast_trace_on = 0;
++	}
++	return count;
++}
++
++static const struct proc_ops bt_ops = {
++	.proc_open = bt_open,
++	.proc_read = seq_read,
++	.proc_lseek = seq_lseek,
++	.proc_release = single_release,
++	.proc_write = bt_write,
++};
++
++static int __init bt_init(void)
++{
++	proc_create("bcast_trace", 0600, NULL, &bt_ops);
++	return 0;
++}
++late_initcall(bt_init);
+diff --git a/arch/arm/kernel/smp_tlb.c b/arch/arm/kernel/smp_tlb.c
+index 4107bf679195..3e68f1ae559e 100644
+--- a/arch/arm/kernel/smp_tlb.c
++++ b/arch/arm/kernel/smp_tlb.c
+@@ -11,6 +11,7 @@
+ #include <asm/smp_plat.h>
+ #include <asm/tlbflush.h>
+ #include <asm/mmu_context.h>
++#include <asm/bcast_trace.h>
+ 
+ /**********************************************************************/
+ 
+@@ -204,6 +205,7 @@ static void local_flush_user_tlb_range(struct vm_area_struct *vma,
+ 
+ void flush_tlb_all(void)
+ {
++	bcast_trace(BT_TLB_ALL, _RET_IP_, 0);
+ 	if (tlb_ops_need_broadcast())
+ 		on_each_cpu(ipi_flush_tlb_all, NULL, 1);
+ 	else
+@@ -219,8 +221,10 @@ void flush_tlb_mm(struct mm_struct *mm)
+ 		preempt_disable();
+ 		if (mm_is_cpu_local(mm))
+ 			local_flush_tlb_mm(mm);
+-		else
++		else {
++			bcast_trace(BT_TLB_MM, _RET_IP_, 0);
+ 			__flush_tlb_mm(mm);
++		}
+ 		preempt_enable();
+ 	}
+ 	broadcast_tlb_mm_a15_erratum(mm);
+@@ -238,8 +242,10 @@ void flush_tlb_page(struct vm_area_struct *vma, unsigned long uaddr)
+ 		preempt_disable();
+ 		if (mm_is_cpu_local(vma->vm_mm))
+ 			local_flush_tlb_page(vma, uaddr);
+-		else
++		else {
++			bcast_trace(BT_TLB_PAGE, _RET_IP_, uaddr);
+ 			__flush_tlb_page(vma, uaddr);
++		}
+ 		preempt_enable();
+ 	}
+ 	broadcast_tlb_mm_a15_erratum(vma->vm_mm);
+@@ -251,8 +257,10 @@ void flush_tlb_kernel_page(unsigned long kaddr)
+ 		struct tlb_args ta;
+ 		ta.ta_start = kaddr;
+ 		on_each_cpu(ipi_flush_tlb_kernel_page, &ta, 1);
+-	} else
++	} else {
++		bcast_trace(BT_TLB_KPAGE, _RET_IP_, kaddr);
+ 		__flush_tlb_kernel_page(kaddr);
++	}
+ 	broadcast_tlb_a15_erratum();
+ }
+ 
+@@ -270,8 +278,10 @@ void flush_tlb_range(struct vm_area_struct *vma,
+ 		preempt_disable();
+ 		if (mm_is_cpu_local(vma->vm_mm))
+ 			local_flush_user_tlb_range(vma, start, end);
+-		else
++		else {
++			bcast_trace(BT_TLB_RANGE, _RET_IP_, end - start);
+ 			local_flush_tlb_range(vma, start, end);
++		}
+ 		preempt_enable();
+ 	}
+ 	broadcast_tlb_mm_a15_erratum(vma->vm_mm);
+@@ -284,13 +294,16 @@ void flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ 		ta.ta_start = start;
+ 		ta.ta_end = end;
+ 		on_each_cpu(ipi_flush_tlb_kernel_range, &ta, 1);
+-	} else
++	} else {
++		bcast_trace(BT_TLB_KRANGE, _RET_IP_, end - start);
+ 		local_flush_tlb_kernel_range(start, end);
++	}
+ 	broadcast_tlb_a15_erratum();
+ }
+ 
+ void flush_bp_all(void)
+ {
++	bcast_trace(BT_BP_ALL, _RET_IP_, 0);
+ 	if (tlb_ops_need_broadcast())
+ 		on_each_cpu(ipi_flush_bp_all, NULL, 1);
+ 	else
+diff --git a/arch/arm/kernel/traps.c b/arch/arm/kernel/traps.c
+index 9838b1f3e797..c3897397c12e 100644
+--- a/arch/arm/kernel/traps.c
++++ b/arch/arm/kernel/traps.c
+@@ -30,6 +30,7 @@
+ 
+ #include <linux/atomic.h>
+ #include <asm/cacheflush.h>
++#include <asm/bcast_trace.h>
+ #include <asm/exception.h>
+ #include <asm/spectre.h>
+ #include <asm/unistd.h>
+@@ -595,6 +596,7 @@ __do_cache_op(unsigned long start, unsigned long end)
+ static inline int
+ do_cache_op(unsigned long start, unsigned long end, int flags)
+ {
++	bcast_trace(BT_CACHEFLUSH, _RET_IP_, end - start);
+ 	if (end < start || flags)
+ 		return -EINVAL;
+ 
