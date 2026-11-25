@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Aveldistarna <Aveldistarna@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 23:06:07 +0900
+Subject: [PATCH] ARM: flush_cache_range: no I-cache invalidate-all for non-aliasing D-caches
+
+With a non-aliasing D-cache, flush_cache_range() on an executable VMA
+(each mprotect() or munmap() of text) still invalidates the I-cache of
+every CPU. With the previous patch this is not needed: a folio whose
+contents change gets PG_icache_clean cleared and is resynced by
+__sync_icache_dcache() when it is next mapped executable. Skip the
+invalidation in that case.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm/mm/flush.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm/mm/flush.c b/arch/arm/mm/flush.c
+index e1a2f33b3686..a2357de8c639 100644
+--- a/arch/arm/mm/flush.c
++++ b/arch/arm/mm/flush.c
+@@ -91,7 +91,14 @@ void flush_cache_range(struct vm_area_struct *vma, unsigned long start, unsigned
+ 		    : "cc");
+ 	}
+ 
+-	if (vma->vm_flags & VM_EXEC)
++	/*
++	 * With a non-aliasing D-cache, changing or removing a mapping cannot
++	 * leave stale instructions behind: a folio whose contents change gets
++	 * PG_icache_clean cleared and is resynced by __sync_icache_dcache() on
++	 * its next executable mapping. Skip the I-cache invalidation here, which
++	 * on SMP is broadcast to every CPU for each mprotect/munmap of text.
++	 */
++	if ((vma->vm_flags & VM_EXEC) && !cache_is_vipt_nonaliasing())
+ 		__flush_icache_all();
+ }
+ 

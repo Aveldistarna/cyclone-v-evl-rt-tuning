@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Aveldistarna <Aveldistarna@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 21:56:16 +0900
+Subject: [PATCH] sched/deadline: skip dl_server_start on isolated CPUs
+
+On a CPU isolated with isolcpus= and nohz_full=, the fair server
+(dl_server) is still started when a task is enqueued there. On a DE10-Nano
+(Cyclone V, CPU1 isolated for an EVL out-of-band loop), the loop on CPU1
+was stalled for 13-30 us at 0.95 s and 1.95 s after it started, each time
+with a reschedule IPI and a function-call IPI to CPU1.
+
+Do not start the server on isolated CPUs. With this change, three 10 s runs
+of the loop had no stall over 10 us and no reschedule or function-call IPI
+to CPU1, and CPU0 kept running normally.
+
+Side effect: fair tasks on an isolated CPU lose the fair server's
+protection against RT starvation.
+---
+ kernel/sched/deadline.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index abd0fb2d839c..b2e58b35fee3 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -1628,6 +1628,10 @@ void dl_server_start(struct sched_dl_entity *dl_se)
+ {
+ 	struct rq *rq = dl_se->rq;
+ 
++	/* Skip DL server on isolated CPUs to avoid 1Hz IPI noise. */
++	if (cpu_is_isolated(cpu_of(rq)))
++		return;
++
+ 	/*
+ 	 * XXX: the apply do not work fine at the init phase for the
+ 	 * fair server because things are not yet set. We need to improve
